@@ -1,6 +1,6 @@
 /**
- * Egern 小组件：VPS 服务器监控 · Hark 液态玻璃 Apple 健身圆环版 v3.3
- * 修复：圆环在 0% 或极低占用时因端点圆角重叠产生的悬浮胶囊显示 Bug
+ * Egern 小组件：VPS 服务器监控 · Hark 液态玻璃 Apple 健身圆环版 v3.6
+ * 优化：中号小组件上下边缘留白与间距调整，使四角文字向外扩展，释放中间显示空间
  */
 
 // ---------------------------------------------------------------------------
@@ -275,10 +275,7 @@ function ringsSvg(values, size, stroke, gap) {
     const r = h - stroke / 2 - i * (stroke + gap);
     if (r <= stroke / 2) return;
     const p = Math.max(0, Math.min(1, Number(v.pct) || 0));
-    // 渲染底层轨道
     body += `<circle cx='${h}' cy='${h}' r='${r.toFixed(2)}' fill='none' stroke='${v.color}' stroke-opacity='0.22' stroke-width='${stroke}'/>`;
-    
-    // 仅当占用率大于 0.5% (p > 0.005) 时才渲染进度弧，彻底消除 0% 时的端点重叠胶囊 Bug
     if (p > 0.005) {
       if (p >= 0.999) {
         body += `<circle cx='${h}' cy='${h}' r='${r.toFixed(2)}' fill='none' stroke='${v.color}' stroke-width='${stroke}'/>`;
@@ -378,21 +375,8 @@ function footer(ctx, s, extra) {
   };
 }
 
-function ringLegendRow(ic, label, pct, color, valueText) {
-  return {
-    type: 'stack', direction: 'row', alignItems: 'center', gap: 6,
-    children: [
-      icon(ic, color, 11),
-      T(label, 11, color, 'semibold'),
-      { type: 'spacer' },
-      M(valueText, 10, C.dim, 'medium'),
-      M(`${Math.round(pct)}%`, 11, color, 'bold'),
-    ],
-  };
-}
-
 function metricRow(ic, label, pct, color, valueText, o = {}) {
-  const barW = o.barW || 145, barH = o.barH || 4;
+  const barW = o.barW || 165, barH = o.barH || 4;
   return {
     type: 'stack', direction: 'column', alignItems: 'start', gap: 2,
     children: [
@@ -436,7 +420,7 @@ function smallWidget(ctx, s) {
   };
 }
 
-/* ---------- 中号 ---------- */
+/* ---------- 中号（已优化上下留白，使四角文字向外扩展） ---------- */
 
 function mediumWidget(ctx, s) {
   const d = s.data;
@@ -451,7 +435,7 @@ function mediumWidget(ctx, s) {
   ];
 
   return {
-    type: 'widget', padding: [12, 14], gap: 12, backgroundGradient: bg(), refreshAfter: refreshAt(ctx),
+    type: 'widget', padding: [10, 14], gap: 10, backgroundGradient: bg(), refreshAfter: refreshAt(ctx),
     children: [
       header(s),
       {
@@ -466,11 +450,11 @@ function mediumWidget(ctx, s) {
             ],
           },
           glass([
-            ringLegendRow('cpu', 'CPU', d.cpuPct, C.cpu, `${d.cores}C`),
-            ringLegendRow('memorychip', 'MEM', d.memPct, C.mem, `${fmtBytes(d.memUsed)}`),
-            ringLegendRow('internaldrive', 'DSK', d.diskPct, C.disk, `${fmtBytes(d.diskUsed)}`),
-            ringLegendRow('antenna.radiowaves.left.and.right', 'TRAF', d.tfPct, tColor, `${fmtBytes(d.tfUsed)}`),
-          ], { flex: 1, gap: 6, padding: [12, 12] }),
+            metricRow('cpu', 'CPU', d.cpuPct, C.cpu, `${d.cores}C · ${d.cpuPct}%`, { barW: 175, barH: 4 }),
+            metricRow('memorychip', 'MEM', d.memPct, C.mem, `${fmtBytes(d.memUsed)}/${fmtBytes(d.memTotal)}`, { barW: 175, barH: 4 }),
+            metricRow('internaldrive', 'DSK', d.diskPct, C.disk, `${fmtBytes(d.diskUsed)}/${fmtBytes(d.diskTotal)}`, { barW: 175, barH: 4 }),
+            metricRow('antenna.radiowaves.left.and.right', 'TRAF', d.tfPct, tColor, `${fmtBytes(d.tfUsed)} / ${fmtBytes(d.tfTotal)}`, { barW: 175, barH: 4 }),
+          ], { flex: 1, gap: 8, padding: [12, 14] }),
         ],
       },
       footer(ctx, s, r ? (r.days === 0 ? '今日重置' : `重置 ${r.days} 天`) : null),
