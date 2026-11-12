@@ -143,7 +143,7 @@ function parseMetrics(ctx, cfg, p, key) {
   const nn = (p[7] || '0 0').split(' ');
   const netRx = Number(nn[0]) || 0, netTx = Number(nn[1]) || 0;
 
-  // 流量统计（修正 vnStat 2.x 的月度/动态周期数据提取）
+    // 流量统计（增强版：兼容多种 vnStat JSON 结构并支持安全切片）
   let tfRx = 0, tfTx = 0, tfSource = '月差值';
   if (p[8]) {
     try {
@@ -152,7 +152,6 @@ function parseMetrics(ctx, cfg, p, key) {
       const monthArr = interfaceData?.traffic?.month;
       
       if (monthArr && monthArr.length > 0) {
-        // 【修正】vnStat 2.x 的每日流量数组键名是单数的 day！
         const dayArr = interfaceData?.traffic?.day;
         if (dayArr && dayArr.length > 0) {
           const now = new Date();
@@ -160,7 +159,7 @@ function parseMetrics(ctx, cfg, p, key) {
           const currentMonth = now.getMonth() + 1; // 1-12
           const resetDay = cfg.resetDay || 1;
 
-          // 计算当前计费周期的起始时间对象
+          // 计算当前计费周期的起始时间（归一化到 0 点）
           let startCycleDate;
           if (now.getDate() >= resetDay) {
             startCycleDate = new Date(currentYear, currentMonth - 1, resetDay);
@@ -171,32 +170,49 @@ function parseMetrics(ctx, cfg, p, key) {
             startCycleDate = new Date(prevYear, prevMonth - 1, resetDay);
           }
 
+          const normalizeTime = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+          const startTime = normalizeTime(startCycleDate);
+          const nowTime = normalizeTime(now);
+
           let cycleRxKiB = 0;
           let cycleTxKiB = 0;
           let matchedDaysCount = 0;
 
-          // 遍历 vnStat 的 day 数组，累加当前周期的流量
+          // 遍历 vnStat 的 day 数组，兼容所有可能的日期字段名
           for (let i = 0; i < dayArr.length; i++) {
             const dItem = dayArr[i];
-            const dDate = new Date(dItem.date.year, dItem.date.month - 1, dItem.date.day);
-            if (dDate >= startCycleDate && dDate <= now) {
-              cycleRxKiB += Number(dItem.rx) || 0;
-              cycleTxKiB += Number(dItem.tx) || 0;
-              matchedDaysCount++;
+            const dObj = dItem.date || dItem;
+            const y = dObj.year || dObj.y || dObj.vnstat_year;
+            const m = dObj.month || dObj.m || dObj.vnstat_month;
+            const d = dObj.day || dObj.d || dObj.vnstat_day;
+
+            if (y && m && d) {
+              const dDate = new Date(y, m - 1, d);
+              const dTime = normalizeTime(dDate);
+              if (dTime >= startTime && dTime <= nowTime) {
+                cycleRxKiB += Number(dItem.rx) || 0;
+                cycleTxKiB += Number(dItem.tx) || 0;
+                matchedDaysCount++;
+              }
             }
           }
 
           if (matchedDaysCount > 0) {
-            // vnStat JSON 返回的 rx/tx 单位是 KiB，乘以 1024 转换为 Bytes
             tfRx = cycleRxKiB * 1024;
             tfTx = cycleTxKiB * 1024;
             tfSource = 'vnstat(cycle)';
           } else {
-            // 兜底：如果没匹配到，取 vnstat 默认当月数据
-            const currentMonthItem = monthArr[monthArr.length - 1];
-            tfRx = (Number(currentMonthItem.rx) || 0) * 1024;
-            tfTx = (Number(currentMonthItem.tx) || 0) * 1024;
-            tfSource = 'vnstat(month)';
+            // 【安全切片兜底】如果日期对象匹配不上，根据重置日直接截取最近几天（例如 11号到今天共 2 天）
+            const daysInCycle = now.getDate() >= resetDay ? (now.getDate() - resetDay + 1) : dayArr.length;
+            const sliceDays = dayArr.slice(-Math.min(daysInCycle, dayArr.length));
+            let sliceRxKiB = 0, sliceTxKiB = 0;
+            sliceDays.forEach(item => {
+              sliceRxKiB += Number(item.rx) || 0;
+              sliceTxKiB += Number(item.tx) || 0;
+            });
+            tfRx = sliceRxKiB * 1024;
+            tfTx = sliceTxKiB * 1024;
+            tfSource = 'vnstat(slice)';
           }
         } else {
           const currentMonthItem = monthArr[monthArr.length - 1];
@@ -209,6 +225,7 @@ function parseMetrics(ctx, cfg, p, key) {
       console.log('vnstat parse error:', e);
     }
   }
+
   // 如果 vnStat 解析失败，则回退到原有的“月差值”本地计算逻辑
   if (tfSource === '月差值') {
     const baseKey = `${key}.netbase`;
