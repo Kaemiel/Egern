@@ -143,7 +143,7 @@ function parseMetrics(ctx, cfg, p, key) {
   const nn = (p[7] || '0 0').split(' ');
   const netRx = Number(nn[0]) || 0, netTx = Number(nn[1]) || 0;
 
-  // 流量统计（修正 vnStat 2.x 的月度/动态周期数据提取）
+    // 流量统计（修正 vnStat 2.x 的月度/动态周期数据提取）
   let tfRx = 0, tfTx = 0, tfSource = '月差值';
   if (p[8]) {
     try {
@@ -152,10 +152,8 @@ function parseMetrics(ctx, cfg, p, key) {
       const monthArr = interfaceData?.traffic?.month;
       
       if (monthArr && monthArr.length > 0) {
-        // vnStat 2.x 的 month 数组中，最后一项通常是当前正在统计的月份（或者当前周期）
-        // 如果你的重置日是 11 号，vnStat 自带的 month 可能按自然月算。
-        // 为了精准对应你的自定义重置日，我们可以尝试从 "days" 数组中按日期过滤并累加当前计费周期的流量！
-        const dayArr = interfaceData?.traffic?.day;
+        // 【修复 1】vnStat 2.x 的每日流量数组键名是 days（复数），不是 day！
+        const dayArr = interfaceData?.traffic?.days;
         if (dayArr && dayArr.length > 0) {
           const now = new Date();
           const currentYear = now.getFullYear();
@@ -167,43 +165,43 @@ function parseMetrics(ctx, cfg, p, key) {
           if (now.getDate() >= resetDay) {
             startCycleDate = new Date(currentYear, currentMonth - 1, resetDay);
           } else {
-            // 如果还没到本月的重置日，说明周期是从上个月的重置日开始的
             let prevMonth = currentMonth - 1;
             let prevYear = currentYear;
             if (prevMonth < 1) { prevMonth = 12; prevYear -= 1; }
             startCycleDate = new Date(prevYear, prevMonth - 1, resetDay);
           }
 
-          let cycleRx = 0;
-          let cycleTx = 0;
+          let cycleRxKiB = 0;
+          let cycleTxKiB = 0;
           let matchedDaysCount = 0;
 
-          // 遍历 vnStat 的 day 数组，把属于当前计费周期的每一天流量累加起来！
+          // 遍历 vnStat 的 days 数组，累加当前周期的流量
           for (let i = 0; i < dayArr.length; i++) {
             const dItem = dayArr[i];
             const dDate = new Date(dItem.date.year, dItem.date.month - 1, dItem.date.day);
             if (dDate >= startCycleDate && dDate <= now) {
-              cycleRx += Number(dItem.rx) || 0;
-              cycleTx += Number(dItem.tx) || 0;
+              cycleRxKiB += Number(dItem.rx) || 0;
+              cycleTxKiB += Number(dItem.tx) || 0;
               matchedDaysCount++;
             }
           }
 
           if (matchedDaysCount > 0) {
-            tfRx = cycleRx;
-            tfTx = cycleTx;
+            // 【修复 2】vnStat JSON 返回的 rx/tx 单位是 KiB，必须乘以 1024 转换为真实的 Bytes，fmtBytes 才能正确显示 GB
+            tfRx = cycleRxKiB * 1024;
+            tfTx = cycleTxKiB * 1024;
             tfSource = 'vnstat(cycle)';
           } else {
-            // 兜底：如果没匹配到，取vnstat默认当月数据
+            // 兜底：如果没匹配到，取 vnstat 默认当月数据（月份数据单位同样是 KiB，需转成 Bytes）
             const currentMonthItem = monthArr[monthArr.length - 1];
-            tfRx = Number(currentMonthItem.rx) || 0;
-            tfTx = Number(currentMonthItem.tx) || 0;
+            tfRx = (Number(currentMonthItem.rx) || 0) * 1024;
+            tfTx = (Number(currentMonthItem.tx) || 0) * 1024;
             tfSource = 'vnstat(month)';
           }
         } else {
           const currentMonthItem = monthArr[monthArr.length - 1];
-          tfRx = Number(currentMonthItem.rx) || 0;
-          tfTx = Number(currentMonthItem.tx) || 0;
+          tfRx = (Number(currentMonthItem.rx) || 0) * 1024;
+          tfTx = (Number(currentMonthItem.tx) || 0) * 1024;
           tfSource = 'vnstat(month)';
         }
       }
