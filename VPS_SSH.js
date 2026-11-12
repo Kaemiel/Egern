@@ -8,10 +8,11 @@
  * 2. 设置开机自启并启动服务：
  *    systemctl enable --now vnstat
  *
- * 3. 修改每月流量重置日期（例如改为每月 11 号重置）：
- *    (1) 编辑配置文件：nano /etc/vnstat.conf
- *    (2) 找到 MonthResetDay 修改为对应数字（如 MonthResetDay 11），保存退出
- *    (3) 重启服务生效：systemctl restart vnstat
+ * 3. （可选）修改 vnstat 自身的月度分界日：
+ *    sed -i -E 's/^;?MonthRotate [0-9]+/MonthRotate 12/' /etc/vnstat.conf
+ *    systemctl restart vnstat
+ *    注意：本脚本按 RESET_DAY 汇总 vnstat 的「每日」数据，MonthRotate 只影响
+ *    vnstat -m 的月度报表，不影响小组件数字，无需与面板计费日保持一致。
  * ===========================================================================
  * 
  * Egern 小组件：VPS 服务器监控 · Hark 液态玻璃 Apple 健身圆环版 v3.9
@@ -98,12 +99,66 @@ async function collect(ctx, cfg) {
     "awk '/MemTotal/{t=$2}/MemFree/{f=$2}/Buffers/{b=$2}/^Cached/{c=$2}END{print t,f,b,c}' /proc/meminfo",
     'df -B1 / | tail -1',
     'nproc',
-    "awk '/^ *(eth|en|wlan|ens|eno|bond|veth)/{rx+=$2;tx+=$10}END{print rx,tx}' /proc/net/dev",
+    // 只统计物理网卡，排除 docker0 / veth / br- 等虚拟接口（否则流量会被重复计算）
+    "awk '/^ *(eth|ens|enp|eno|enx|wlan|wlp|venet|bond)/{rx+=$2;tx+=$10}END{print rx+0,tx+0}' /proc/net/dev",
     'vnstat --json 2>/dev/null || echo ""',
   ];
   const { stdout } = await session.exec(cmds.join(` && echo '${SEP}' && `));
   await session.close();
   return stdout.split(SEP).map(s => s.trim());
+}
+
+// ---------------------------------------------------------------------------
+// vnstat 数据解析辅助
+// ---------------------------------------------------------------------------
+
+const VIRTUAL_IFACE = /^(lo|docker|veth|br-|virbr|cni|flannel|kube|podman|tun|tap|wg|zt|tailscale|dummy|ifb|gre|sit|ip6)/i;
+const PHYSICAL_IFACE = /^(eth|ens|enp|eno|enx|en|wlan|wlp|venet|bond)/i;
+
+// 从 vnstat JSON 中挑出真正承载业务流量的网卡（默认第一个可能是 docker0）
+function pickTrafficInterface(vn) {
+  const list = Array.isArray(vn?.interfaces)
+    ? vn.interfaces
+    : Object.values(vn?.interfaces || {});
+  if (!list.length) return null;
+
+  const bytes = (i) => {
+    const t = i?.traffic?.total || {};
+    return (Number(t.rx) || 0) + (Number(t.tx) || 0);
+  };
+
+  const physical = list.filter(i => {
+    const n = String(i?.name || '');
+    return PHYSICAL_IFACE.test(n) && !VIRTUAL_IFACE.test(n);
+  });
+  const nonVirtual = list.filter(i => !VIRTUAL_IFACE.test(String(i?.name || '')));
+  const pool = physical.length ? physical : (nonVirtual.length ? nonVirtual : list);
+  return pool.reduce((best, i) => (bytes(i) > bytes(best) ? i : best), pool[0]);
+}
+
+function dayStamp(item) {
+  const d = item?.date || item;
+  if (!d || !d.year || !d.month || !d.day) return null;
+  return new Date(d.year, d.month - 1, d.day).getTime();
+}
+
+function monthStamp(item) {
+  const d = item?.date || item;
+  if (!d || !d.year || !d.month) return null;
+  return new Date(d.year, d.month - 1, 1).getTime();
+}
+
+// 当前计费周期起点（按 resetDay，处理跨月与短月）
+function cycleStartOf(now, resetDay) {
+  const day = Math.min(Math.max(1, Number(resetDay) || 1), 31);
+  let y = now.getFullYear();
+  let m = now.getMonth();
+  if (now.getDate() < day) {
+    m -= 1;
+    if (m < 0) { m = 11; y -= 1; }
+  }
+  const lastDay = new Date(y, m + 1, 0).getDate();
+  return new Date(y, m, Math.min(day, lastDay)).getTime();
 }
 
 function parseMetrics(ctx, cfg, p, key) {
@@ -143,82 +198,48 @@ function parseMetrics(ctx, cfg, p, key) {
   const nn = (p[7] || '0 0').split(' ');
   const netRx = Number(nn[0]) || 0, netTx = Number(nn[1]) || 0;
 
-    // 流量统计（增强版：兼容多种 vnStat JSON 结构并支持安全切片）
+  // 流量统计：取 vnstat「每日」数据，按计费周期（RESET_DAY）累加
+  // 修正：1) 不再固定取 interfaces[0]（实测首项常是 docker0，只有几百 MB）
+  //      2) vnstat 2.x 的 JSON 单位是字节，不能再 *1024
   let tfRx = 0, tfTx = 0, tfSource = '月差值';
   if (p[8]) {
     try {
       const vn = JSON.parse(p[8]);
-      const interfaceData = vn.interfaces?.[0];
-      const monthArr = interfaceData?.traffic?.month;
-      
-      if (monthArr && monthArr.length > 0) {
-        const dayArr = interfaceData?.traffic?.day;
-        if (dayArr && dayArr.length > 0) {
-          const now = new Date();
-          const currentYear = now.getFullYear();
-          const currentMonth = now.getMonth() + 1; // 1-12
-          const resetDay = cfg.resetDay || 1;
+      const iface = pickTrafficInterface(vn);
+      const traffic = iface?.traffic || {};
+      const dayArr = Array.isArray(traffic.day) ? traffic.day : [];
+      const monthArr = Array.isArray(traffic.month) ? traffic.month : [];
+      const unit = String(vn.jsonversion) === '2' ? 1 : 1024;
 
-          // 计算当前计费周期的起始时间（归一化到 0 点）
-          let startCycleDate;
-          if (now.getDate() >= resetDay) {
-            startCycleDate = new Date(currentYear, currentMonth - 1, resetDay);
-          } else {
-            let prevMonth = currentMonth - 1;
-            let prevYear = currentYear;
-            if (prevMonth < 1) { prevMonth = 12; prevYear -= 1; }
-            startCycleDate = new Date(prevYear, prevMonth - 1, resetDay);
-          }
+      if (dayArr.length || monthArr.length) {
+        const resetDay = cfg.resetDay || 1;
+        // 用 vnstat 的 updated 日期代表「服务器今天」，避免手机与服务端时区不一致
+        const upd = traffic.updated || iface?.updated;
+        const nowSrv = upd?.date
+          ? new Date(upd.date.year, upd.date.month - 1, upd.date.day)
+          : new Date();
+        const startTime = cycleStartOf(nowSrv, resetDay);
+        const endTime = new Date(nowSrv.getFullYear(), nowSrv.getMonth(), nowSrv.getDate()).getTime();
 
-          const normalizeTime = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
-          const startTime = normalizeTime(startCycleDate);
-          const nowTime = normalizeTime(now);
+        let rx = 0, tx = 0, hits = 0;
+        for (const item of dayArr) {
+          const t = dayStamp(item);
+          if (t === null || t < startTime || t > endTime) continue;
+          rx += Number(item.rx) || 0;
+          tx += Number(item.tx) || 0;
+          hits++;
+        }
 
-          let cycleRxKiB = 0;
-          let cycleTxKiB = 0;
-          let matchedDaysCount = 0;
-
-          // 遍历 vnStat 的 day 数组，兼容所有可能的日期字段名
-          for (let i = 0; i < dayArr.length; i++) {
-            const dItem = dayArr[i];
-            const dObj = dItem.date || dItem;
-            const y = dObj.year || dObj.y || dObj.vnstat_year;
-            const m = dObj.month || dObj.m || dObj.vnstat_month;
-            const d = dObj.day || dObj.d || dObj.vnstat_day;
-
-            if (y && m && d) {
-              const dDate = new Date(y, m - 1, d);
-              const dTime = normalizeTime(dDate);
-              if (dTime >= startTime && dTime <= nowTime) {
-                cycleRxKiB += Number(dItem.rx) || 0;
-                cycleTxKiB += Number(dItem.tx) || 0;
-                matchedDaysCount++;
-              }
-            }
-          }
-
-          if (matchedDaysCount > 0) {
-            tfRx = cycleRxKiB * 1024;
-            tfTx = cycleTxKiB * 1024;
-            tfSource = 'vnstat(cycle)';
-          } else {
-            // 【安全切片兜底】如果日期对象匹配不上，根据重置日直接截取最近几天（例如 11号到今天共 2 天）
-            const daysInCycle = now.getDate() >= resetDay ? (now.getDate() - resetDay + 1) : dayArr.length;
-            const sliceDays = dayArr.slice(-Math.min(daysInCycle, dayArr.length));
-            let sliceRxKiB = 0, sliceTxKiB = 0;
-            sliceDays.forEach(item => {
-              sliceRxKiB += Number(item.rx) || 0;
-              sliceTxKiB += Number(item.tx) || 0;
-            });
-            tfRx = sliceRxKiB * 1024;
-            tfTx = sliceTxKiB * 1024;
-            tfSource = 'vnstat(slice)';
-          }
-        } else {
-          const currentMonthItem = monthArr[monthArr.length - 1];
-          tfRx = (Number(currentMonthItem.rx) || 0) * 1024;
-          tfTx = (Number(currentMonthItem.tx) || 0) * 1024;
-          tfSource = 'vnstat(month)';
+        if (hits > 0) {
+          tfRx = rx * unit;
+          tfTx = tx * unit;
+          tfSource = 'vnstat·周期';
+        } else if (monthArr.length) {
+          // 周期内没有日数据（周期刚开始 / 日记录被清理）时退回最新月份
+          const latest = monthArr.reduce((a, b) => ((monthStamp(b) || 0) > (monthStamp(a) || 0) ? b : a));
+          tfRx = (Number(latest.rx) || 0) * unit;
+          tfTx = (Number(latest.tx) || 0) * unit;
+          tfSource = 'vnstat·月';
         }
       }
     } catch (e) {
