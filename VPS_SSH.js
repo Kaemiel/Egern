@@ -143,7 +143,7 @@ function parseMetrics(ctx, cfg, p, key) {
   const nn = (p[7] || '0 0').split(' ');
   const netRx = Number(nn[0]) || 0, netTx = Number(nn[1]) || 0;
 
-    // 流量统计（修正 vnStat 2.x 的月度/动态周期数据提取）
+  // 流量统计（修正 vnStat 2.x 的月度/动态周期数据提取）
   let tfRx = 0, tfTx = 0, tfSource = '月差值';
   if (p[8]) {
     try {
@@ -152,8 +152,8 @@ function parseMetrics(ctx, cfg, p, key) {
       const monthArr = interfaceData?.traffic?.month;
       
       if (monthArr && monthArr.length > 0) {
-        // 【修复 1】vnStat 2.x 的每日流量数组键名是 days（复数），不是 day！
-        const dayArr = interfaceData?.traffic?.days;
+        // 【修正】vnStat 2.x 的每日流量数组键名是单数的 day！
+        const dayArr = interfaceData?.traffic?.day;
         if (dayArr && dayArr.length > 0) {
           const now = new Date();
           const currentYear = now.getFullYear();
@@ -175,7 +175,7 @@ function parseMetrics(ctx, cfg, p, key) {
           let cycleTxKiB = 0;
           let matchedDaysCount = 0;
 
-          // 遍历 vnStat 的 days 数组，累加当前周期的流量
+          // 遍历 vnStat 的 day 数组，累加当前周期的流量
           for (let i = 0; i < dayArr.length; i++) {
             const dItem = dayArr[i];
             const dDate = new Date(dItem.date.year, dItem.date.month - 1, dItem.date.day);
@@ -187,12 +187,12 @@ function parseMetrics(ctx, cfg, p, key) {
           }
 
           if (matchedDaysCount > 0) {
-            // 【修复 2】vnStat JSON 返回的 rx/tx 单位是 KiB，必须乘以 1024 转换为真实的 Bytes，fmtBytes 才能正确显示 GB
+            // vnStat JSON 返回的 rx/tx 单位是 KiB，乘以 1024 转换为 Bytes
             tfRx = cycleRxKiB * 1024;
             tfTx = cycleTxKiB * 1024;
             tfSource = 'vnstat(cycle)';
           } else {
-            // 兜底：如果没匹配到，取 vnstat 默认当月数据（月份数据单位同样是 KiB，需转成 Bytes）
+            // 兜底：如果没匹配到，取 vnstat 默认当月数据
             const currentMonthItem = monthArr[monthArr.length - 1];
             tfRx = (Number(currentMonthItem.rx) || 0) * 1024;
             tfTx = (Number(currentMonthItem.tx) || 0) * 1024;
@@ -209,7 +209,6 @@ function parseMetrics(ctx, cfg, p, key) {
       console.log('vnstat parse error:', e);
     }
   }
-
   // 如果 vnStat 解析失败，则回退到原有的“月差值”本地计算逻辑
   if (tfSource === '月差值') {
     const baseKey = `${key}.netbase`;
