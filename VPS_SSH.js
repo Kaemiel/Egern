@@ -8,11 +8,10 @@
  * 2. 设置开机自启并启动服务：
  *    systemctl enable --now vnstat
  *
- * 3. （可选）修改 vnstat 自身的月度分界日：
- *    sed -i -E 's/^;?MonthRotate [0-9]+/MonthRotate 12/' /etc/vnstat.conf
- *    systemctl restart vnstat
- *    注意：本脚本按 RESET_DAY 汇总 vnstat 的「每日」数据，MonthRotate 只影响
- *    vnstat -m 的月度报表，不影响小组件数字，无需与面板计费日保持一致。
+ * 3. 修改每月流量重置日期（例如改为每月 11 号重置）：
+ *    (1) 编辑配置文件：nano /etc/vnstat.conf
+ *    (2) 找到 MonthResetDay 修改为对应数字（如 MonthResetDay 11），保存退出
+ *    (3) 重启服务生效：systemctl restart vnstat
  * ===========================================================================
  * 
  * Egern 小组件：VPS 服务器监控 · Hark 液态玻璃 Apple 健身圆环版 v3.9
@@ -108,32 +107,27 @@ async function collect(ctx, cfg) {
   return stdout.split(SEP).map(s => s.trim());
 }
 
-// ---------------------------------------------------------------------------
-// vnstat 数据解析辅助
-// ---------------------------------------------------------------------------
-
-const VIRTUAL_IFACE = /^(lo|docker|veth|br-|virbr|cni|flannel|kube|podman|tun|tap|wg|zt|tailscale|dummy|ifb|gre|sit|ip6)/i;
+// vnstat 会同时记录 docker0 / vethX / br- 等虚拟接口，它们的流量是从物理网卡复制出来的，
+// 必须排除，否则一张网卡的业务流量会被算好几遍
+const VIRTUAL_IFACE = /^(lo|docker|veth|br-|virbr|cni|flannel|kube|podman|tun|tap|wg|zt|tailscale|dummy|ifb|sit|gre)/i;
 const PHYSICAL_IFACE = /^(eth|ens|enp|eno|enx|en|wlan|wlp|venet|bond)/i;
 
-// 从 vnstat JSON 中挑出真正承载业务流量的网卡（默认第一个可能是 docker0）
 function pickTrafficInterface(vn) {
   const list = Array.isArray(vn?.interfaces)
     ? vn.interfaces
     : Object.values(vn?.interfaces || {});
   if (!list.length) return null;
-
-  const bytes = (i) => {
+  const total = (i) => {
     const t = i?.traffic?.total || {};
     return (Number(t.rx) || 0) + (Number(t.tx) || 0);
   };
-
   const physical = list.filter(i => {
     const n = String(i?.name || '');
     return PHYSICAL_IFACE.test(n) && !VIRTUAL_IFACE.test(n);
   });
-  const nonVirtual = list.filter(i => !VIRTUAL_IFACE.test(String(i?.name || '')));
-  const pool = physical.length ? physical : (nonVirtual.length ? nonVirtual : list);
-  return pool.reduce((best, i) => (bytes(i) > bytes(best) ? i : best), pool[0]);
+  const real = list.filter(i => !VIRTUAL_IFACE.test(String(i?.name || '')));
+  const pool = physical.length ? physical : (real.length ? real : list);
+  return pool.reduce((best, i) => (total(i) > total(best) ? i : best), pool[0]);
 }
 
 function dayStamp(item) {
@@ -148,17 +142,18 @@ function monthStamp(item) {
   return new Date(d.year, d.month - 1, 1).getTime();
 }
 
-// 当前计费周期起点（按 resetDay，处理跨月与短月）
+// 当前计费周期的起始日（0 点），若今天还没到重置日则回退到上个月
 function cycleStartOf(now, resetDay) {
-  const day = Math.min(Math.max(1, Number(resetDay) || 1), 31);
   let y = now.getFullYear();
   let m = now.getMonth();
+  const len = (yy, mm) => new Date(yy, mm + 1, 0).getDate();
+  let day = Math.min(Math.max(1, resetDay), len(y, m));
   if (now.getDate() < day) {
     m -= 1;
     if (m < 0) { m = 11; y -= 1; }
+    day = Math.min(Math.max(1, resetDay), len(y, m));
   }
-  const lastDay = new Date(y, m + 1, 0).getDate();
-  return new Date(y, m, Math.min(day, lastDay)).getTime();
+  return new Date(y, m, day).getTime();
 }
 
 function parseMetrics(ctx, cfg, p, key) {
@@ -354,6 +349,7 @@ const C = {
   text: { light: '#000000', dark: '#FFFFFF' },
   dim:  { light: '#3C3C4399', dark: '#EBEBF599' },
   glass: { light: '#FFFFFFA6', dark: '#FFFFFF1A' },
+  line: { light: '#00000014', dark: '#FFFFFF24' },
   accent: '#0A84FF',
   cpu: '#0A84FF',
   mem: '#BF5AF2',
@@ -363,13 +359,16 @@ const C = {
   fail: '#FF453A',
 };
 
-function bg() {
+// 完全不画背景：与油价组件同款结构。
+// iOS 26「透明」外观会替换/压平任何自定义背景（渐变、纯色都试过，都会变白底），
+// 只有「不声明背景」时系统才会正常给玻璃材质，内容才能显示出来。
+function frame(ctx, opts) {
   return {
-    type: 'linear',
-    colors: [{ light: '#EDF4FF', dark: '#0B1530' }, { light: '#F3EEFF', dark: '#1A0F33' }, { light: '#F2FBF7', dark: '#06120E' }],
-    stops: [0, 0.55, 1],
-    startPoint: { x: 0, y: 0 },
-    endPoint: { x: 1, y: 1 },
+    type: 'widget',
+    padding: opts.padding,
+    gap: opts.gap,
+    refreshAfter: refreshAt(ctx),
+    children: opts.children,
   };
 }
 
@@ -430,7 +429,8 @@ function dot(color) {
 }
 
 function glass(children, extra = {}) {
-  return { type: 'stack', direction: 'column', alignItems: 'start', gap: 6, padding: 12, borderRadius: 20, backgroundColor: C.glass, children, ...extra };
+  // 去掉根背景后卡片需要描边才看得出层次（浅色下白卡叠在白底上）
+  return { type: 'stack', direction: 'column', alignItems: 'start', gap: 6, padding: 12, borderRadius: 20, backgroundColor: C.glass, borderWidth: 0.5, borderColor: C.line, children, ...extra };
 }
 
 // ---------------------------------------------------------------------------
@@ -506,9 +506,7 @@ function metricRow(ic, label, pct, color, valueText, o = {}) {
 function smallWidget(ctx, s) {
   const d = s.data;
   const tColor = trafficColor(d.tfPct);
-  return {
-    type: 'widget', padding: 12, gap: 5, backgroundGradient: bg(), refreshAfter: refreshAt(ctx),
-    children: [
+  return frame(ctx, { padding: 12, gap: 5, children: [
       smallHeader(s),
       { type: 'spacer' },
       metricRow('cpu', 'CPU', d.cpuPct, C.cpu, `${d.cores}C · ${d.cpuPct}%`, { barW: 145, barH: 4 }),
@@ -523,8 +521,7 @@ function smallWidget(ctx, s) {
           M(d.load.join(' / '), 9, C.text, 'medium', { minScale: 0.6 })
         ]
       }
-    ],
-  };
+  ] });
 }
 
 /* ---------- 中号 ---------- */
@@ -541,9 +538,7 @@ function mediumWidget(ctx, s) {
     { pct: d.tfPct / 100, color: tColor },
   ];
 
-  return {
-    type: 'widget', padding: [8, 14], gap: 8, backgroundGradient: bg(), refreshAfter: refreshAt(ctx),
-    children: [
+  return frame(ctx, { padding: [12, 14], gap: 12, children: [
       header(s),
       {
         type: 'stack', direction: 'row', alignItems: 'center', gap: 12, flex: 1,
@@ -565,8 +560,7 @@ function mediumWidget(ctx, s) {
         ],
       },
       footer(ctx, s, r ? (r.days === 0 ? '今日重置' : `重置 ${r.days} 天`) : null),
-    ],
-  };
+  ] });
 }
 
 /* ---------- 大号 ---------- */
@@ -599,9 +593,7 @@ function largeWidget(ctx, s) {
   const d = s.data;
   const r = nextReset(ctx.env?.RESET_DAY || 1);
   const tColor = trafficColor(d.tfPct);
-  return {
-    type: 'widget', padding: [14, 16], gap: 9, backgroundGradient: bg(), refreshAfter: refreshAt(ctx),
-    children: [
+  return frame(ctx, { padding: [14, 16], gap: 9, children: [
       header(s),
       {
         type: 'stack', direction: 'row', gap: 8,
@@ -639,8 +631,7 @@ function largeWidget(ctx, s) {
       },
       { type: 'spacer' },
       footer(ctx, s, r ? (r.days === 0 ? '今日重置' : `${r.days} 天后重置`) : null),
-    ],
-  };
+  ] });
 }
 
 /* ---------- 锁屏 ---------- */
@@ -680,17 +671,14 @@ function lockWidget(ctx, s, family) {
 }
 
 function emptyWidget(ctx, message, sub) {
-  return {
-    type: 'widget', padding: 16, gap: 8, backgroundGradient: bg(),
-    children: [
+  return frame(ctx, { padding: 16, gap: 8, children: [
       { type: 'stack', direction: 'row', alignItems: 'center', gap: 5, children: [icon('server.rack', C.accent, 13), T('服务器监控', 13, C.text, 'semibold')] },
       { type: 'spacer' },
       icon('exclamationmark.triangle', C.dim, 22),
       T(message, 14, C.text, 'semibold'),
       T(sub, 10, C.dim, 'regular', { maxLines: 3 }),
       { type: 'spacer' },
-    ],
-  };
+  ] });
 }
 
 // ---------------------------------------------------------------------------
